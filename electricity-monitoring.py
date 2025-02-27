@@ -8,6 +8,7 @@ import requests
 import json
 import datetime
 from dateutil import parser
+from snowflake import SnowflakeGenerator
 
 
 class DatabaseConfig:
@@ -366,14 +367,14 @@ def fetch_smart_meter_products():
                                 for window_idx in range(total_windows):
                                     with connection.cursor(pymysql.cursors.SSDictCursor) as data_cursor:
                                         # 计算时间窗口（包含两端）
-                                        base_time = datetime.now().replace(second=0, microsecond=0)
+                                        base_time = datetime.datetime.now().replace(second=0, microsecond=0)
                                         # 分钟取整到30分钟倍数
                                         rounded_minute = base_time.minute // 30 * 30
                                         base_time = base_time.replace(minute=rounded_minute)
 
-                                        window_end = (base_time - timedelta(minutes=30 * window_idx)).replace(second=59,
+                                        window_end = (base_time - datetime.timedelta(minutes=30 * window_idx)).replace(second=59,
                                                                                                               microsecond=999999)
-                                        window_start = (window_end - timedelta(minutes=30)).replace(second=0,
+                                        window_start = (window_end - datetime.timedelta(minutes=30)).replace(second=0,
                                                                                                     microsecond=0)
 
                                         # 调整查询条件包含房间号
@@ -395,7 +396,7 @@ def fetch_smart_meter_products():
 
                                         # 安全打印SQL
                                         debug_sql = query % tuple(
-                                            f"'{p.strftime('%Y-%m-%d %H:%M:%S')}'" if isinstance(p, datetime)
+                                            f"'{p.strftime('%Y-%m-%d %H:%M:%S')}'" if isinstance(p, datetime.datetime)
                                             else f"'{escape_string(str(p))}'"
                                             for p in params
                                         )
@@ -611,7 +612,7 @@ def find_dept_id(data):
     """
     查询房间信息（不保存数据）
     :param data: 预测结果数据
-    :return: 查询到的房间信息字典，只包含部门ID和房间号
+    :return: 查询到的房间信息字典，格式为 {dept_id: [{room_number: xxx, room_type_id: xxx, abnormal_time: xxx, device_name: xxx}]}
     """
     if not data:
         print("没有数据需要查询")
@@ -646,17 +647,24 @@ def find_dept_id(data):
         product_dept_map = {}
         for row in cursor.fetchall():
             product_key, dept_id = row
+            # 确保dept_id是字符串类型
+            dept_id = str(dept_id)
+            # 检查是否包含逗号，如果包含则分割为单独的部门ID
+            if ',' in dept_id:
+                print(f"警告: 部门ID '{dept_id}' 包含逗号，将被分割为单独部门")
+                # 处理组合部门ID情况，只取第一个部门ID
+                dept_id = dept_id.split(',')[0].strip()
+            
             product_dept_map[product_key] = {
                 'dept_id': dept_id
             }
 
         print(f"查询到 {len(product_dept_map)} 个产品的部门信息: {list(product_dept_map.keys())}")
 
-        # 收集所有需要查询的产品部门及房间号
-        room_info_map = {}
-        abnormal_rooms_count = 0
-
-        # 遍历所有产品，收集并查询异常房间
+        # 收集所有需要查询的房间信息
+        dept_room_num = {}
+        
+        # 遍历所有产品，收集异常房间信息
         for product_key, categories in data.items():
             # 跳过没有部门信息的产品
             if product_key not in product_dept_map:
@@ -664,95 +672,93 @@ def find_dept_id(data):
                 continue
 
             # 获取部门ID
-            dept_id_str = product_dept_map[product_key]['dept_id']
-
-            # 收集异常房间的房间号
+            dept_id = product_dept_map[product_key]['dept_id']
+            
+            # 确保部门ID有对应的列表
+            if dept_id not in dept_room_num:
+                dept_room_num[dept_id] = []
+            
+            # 收集异常房间的房间号和时间戳
             if 'abnormal' in categories and categories['abnormal']:
-                abnormal_rooms = list(categories['abnormal'].keys())
-                abnormal_rooms_count += len(abnormal_rooms)
-                print(f"产品 {product_key} (dept_id: {dept_id_str}) 有 {len(abnormal_rooms)} 个异常房间: {abnormal_rooms}")
-
-                # 为每个房间执行单独查询
-                for room_num in abnormal_rooms:
-                    # 构建查询语句
-                    room_query = f"""
-                        SELECT *
-                        FROM hotel_room_info
-                        WHERE dept_id IN ({dept_id_str}) AND room_number = %s
+                for room_num, room_data in categories['abnormal'].items():
+                    # 提取时间戳
+                    abnormal_time = room_data.get('timestamp')
+                    
+                    # 查询设备名称
+                    device_name_query = """
+                        SELECT sm.device_name  
+                        FROM smart_meter sm
+                        WHERE sm.product_key = %s AND sm.room_num = %s
+                        LIMIT 1
                     """
-
+                    
+                    device_name = "智能电表"  # 默认设备名称
                     try:
-                        cursor.execute(room_query, [room_num])
-                        results = cursor.fetchall()
-
-                        if results:
-                            print(f"房间 {room_num} 查询成功，返回 {len(results)} 个结果")
-
-                            # 获取字段列表
-                            field_names = [i[0] for i in cursor.description]
-
-                            # 处理查询结果
-                            for row in results:
-                                # 创建字典存储房间信息
-                                room_info = {}
-                                for i, name in enumerate(field_names):
-                                    room_info[name] = row[i]
-
-                                # 获取实际的dept_id和room_number
-                                dept_id_idx = field_names.index('dept_id') if 'dept_id' in field_names else -1
-                                room_idx = field_names.index('room_number') if 'room_number' in field_names else -1
-
-                                if dept_id_idx >= 0 and room_idx >= 0:
-                                    actual_dept_id = row[dept_id_idx]
-                                    actual_room_num = row[room_idx]
-
-                                    # 使用实际值作为键
-                                    key = (str(actual_dept_id), str(actual_room_num))
-                                    room_info_map[key] = room_info
+                        cursor.execute(device_name_query, [product_key, room_num])
+                        device_result = cursor.fetchone()
+                        
+                        if device_result and device_result[0]:
+                            device_name = device_result[0]
                         else:
-                            print(f"房间 {room_num} 在部门 {dept_id_str} 中未找到记录")
-
+                            print(f"未找到设备名称: 产品={product_key}, 房间={room_num}")
                     except Exception as e:
-                        print(f"查询房间 {room_num} 失败: {e}")
-
-        print(f"总共查询了 {abnormal_rooms_count} 个异常房间，找到 {len(room_info_map)} 个房间信息")
-
-        # 简化返回结果，保留部门ID、房间号和房间类型ID
-        simplified_result = {}
-        for (dept_id, room_num), room_info in room_info_map.items():
-            # 提取room_type_id
-            room_type_id = None
-            if 'room_type_id' in room_info:
-                room_type_id = room_info['room_type_id']
-            
-            # 使用部门ID作为键
-            if dept_id not in simplified_result:
-                simplified_result[dept_id] = []
-            
-            # 添加包含房间号和房间类型ID的字典
-            room_data = {
-                "room_number": room_num,
-                "room_type_id": room_type_id
-            }
-            simplified_result[dept_id].append(room_data)
+                        print(f"查询设备名称时出错: {e}")
+                    
+                    # 查询房间类型ID
+                    room_type_query = """
+                        SELECT room_type_id
+                        FROM pms_beyond_room_info
+                        WHERE dept_id = %s AND room_number = %s
+                        LIMIT 1
+                    """
+                    
+                    try:
+                        cursor.execute(room_type_query, [dept_id, room_num])
+                        room_type_result = cursor.fetchone()
+                        
+                        if room_type_result and room_type_result[0]:
+                            room_type_id = room_type_result[0]
+                        else:
+                            print(f"未找到房间类型ID: 部门={dept_id}, 房间={room_num}")
+                            room_type_id = f"RT{room_num[:2]}"  # 默认使用房间号前两位作为房间类型前缀
+                    except Exception as e:
+                        print(f"查询房间类型时出错: {e}")
+                        room_type_id = f"RT{room_num[:2]}"
+                    
+                    # 添加房间信息，确保结构完全符合预期
+                    room_info = {
+                        'room_number': room_num,
+                        'room_type_id': room_type_id,
+                        'abnormal_time': abnormal_time,
+                        'device_name': device_name  # 添加设备名称字段
+                    }
+                    
+                    # 添加到对应部门的房间列表
+                    dept_room_num[dept_id].append(room_info)
+                    
+                    print(f"添加异常房间: 部门={dept_id}, 房间={room_num}, 类型={room_type_id}, 设备={device_name}, 时间={abnormal_time}")
 
         # 关闭数据库连接
         cursor.close()
         conn.close()
-
-        return simplified_result  # 返回简化后的结果
-
-    except OperationalError as e:
+        
+        print(f"处理完成，返回 {len(dept_room_num)} 个部门的房间信息")
+        return dept_room_num
+        
+    except pymysql.OperationalError as e:
         print(f"数据库连接错误: {e}")
-        return {}
     except Exception as e:
-        print(f"查询时出现未知错误: {e}")
-        return {}
+        print(f"查询过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # 发生错误时返回空字典
+    return {}
 
 def find_datas(dept_room_num):
     """
     根据部门ID和房间信息查询部门及房间详情
-    :param dept_room_num: 部门ID和房间信息的映射，格式为 {dept_id: [{room_number: xxx, room_type_id: xxx}]}
+    :param dept_room_num: 部门ID和房间信息的映射，格式为 {dept_id: [{room_number: xxx, room_type_id: xxx, abnormal_time: xxx}]}
     :return: 部门及房间信息字典，以部门ID为键
     """
     
@@ -784,14 +790,14 @@ def find_datas(dept_room_num):
             """
             
             # 执行查询
-            print(f"执行查询部门: {dept_id}")
+            # print(f"执行查询部门: {dept_id}")
             cursor.execute(dept_query, [dept_id])
             
             # 获取结果
             result = cursor.fetchone()
             
             if result:
-                print(f"部门ID {dept_id} 查询成功")
+                # print(f"部门ID {dept_id} 查询成功")
                 
                 # 获取字段列表
                 field_names = [i[0] for i in cursor.description]
@@ -811,6 +817,8 @@ def find_datas(dept_room_num):
                 for room_data in rooms_data:
                     room_number = room_data.get('room_number')
                     room_type_id = room_data.get('room_type_id')
+                    abnormal_time = room_data.get('abnormal_time')  # 获取异常时间
+                    device_name = room_data.get('device_name')  # 获取异常时间
                     
                     if room_number and room_type_id:
                         # 构建房间查询
@@ -821,7 +829,7 @@ def find_datas(dept_room_num):
                         """
                         
                         # 执行查询
-                        print(f"查询房间: {room_number}, 部门ID: {dept_id}")
+                        # print(f"查询房间: {room_number}, 部门ID: {dept_id}")
                         cursor.execute(room_query, [dept_id, room_number, room_type_id])
                         
                         # 获取结果
@@ -829,6 +837,10 @@ def find_datas(dept_room_num):
                         
                         # 创建房间信息字典
                         room_info = {'room_number': room_number}
+                        
+                        # 添加异常时间到房间信息
+                        room_info['abnormal_time'] = abnormal_time
+                        room_info['device_name'] = device_name
                         
                         if room_result:
                             # 获取房间字段列表
@@ -889,9 +901,9 @@ def find_datas(dept_room_num):
                             room_info['check_in_detail'] = formatted_check_in
                             room_info['check_out_detail'] = formatted_check_out
                             
-                            print(f"房间 {room_number} 入住日期: {formatted_check_in}, 退房日期: {formatted_check_out}")
+                            # print(f"房间 {room_number} 入住日期: {formatted_check_in}, 退房日期: {formatted_check_out}, 异常时间: {abnormal_time}")
                         else:
-                            print(f"房间 {room_number} 没有找到入住记录")
+                            print(f"房间 {room_number} 没有找到入住记录, 异常时间: {abnormal_time}")
                             room_info['check_in_detail'] = None
                             room_info['check_out_detail'] = None
                         
@@ -908,7 +920,7 @@ def find_datas(dept_room_num):
                 
                 # 打印部门基本信息
                 dept_name = dept_info.get('dept_name', '未知')
-                print(f"部门ID: {dept_id}, 部门名称: {dept_name}, 关联房间数: {len(room_details)}")
+                # print(f"部门ID: {dept_id}, 部门名称: {dept_name}, 关联房间数: {len(room_details)}")
             else:
                 print(f"部门ID {dept_id} 未找到信息")
         
@@ -926,24 +938,164 @@ def find_datas(dept_room_num):
         traceback.print_exc()  # 打印详细错误信息
     
     return dept_info_map
+
+def save_to_mysql(dept_info_map):
+    """
+    将部门和房间信息保存到MySQL数据库
+    :param dept_info_map: 部门及房间信息字典，来自find_datas函数
+    :return: 成功保存的记录数和JSON格式的数据列表，用于发送到飞书
+    """
+    if not dept_info_map:
+        print("没有数据需要保存")
+        return 0, []
+
+    # 创建雪花ID生成器
+    gen = SnowflakeGenerator(42)  # 设置一个机器ID
     
-    return dept_info_map
+    # 记录计数
+    saved_count = 0
+    
+    # 用于存储所有记录的JSON数据
+    json_records = []
+    
+    # 定义房间状态映射字典（英文代码 -> 中文名称）
+    room_status_map = {
+        "OD": "住脏",
+        "OC": "住净",
+        "VD": "空脏",
+        "VC": "空净",
+        "OOO": "维修",
+        "LOCKED": "锁房"
+    }
+    
+    try:
+        # 连接数据库
+        conn = pymysql.connect(**DatabaseConfig.get_connection_params())
+        cursor = conn.cursor()
+        
+        print("连接数据库成功，准备保存数据...")
+        
+        # 遍历所有部门信息
+        for dept_id, dept_info in dept_info_map.items():
+            dept_name = dept_info.get('dept_name', '未知酒店')
+            dept_code = dept_info.get('dept_code', dept_id)
+            dept_brand = dept_info.get('brand', '未知品牌')
+            
+            # 遍历该部门下的所有房间
+            rooms = dept_info.get('rooms', [])
+            for room in rooms:
+                room_num = room.get('room_number', '')
+                
+                # 获取原始房间状态并转换为中文
+                original_status = room.get('status', '未知')
+                room_status = room_status_map.get(original_status, '未知')
+                
+                # 处理入住和退房时间
+                check_in_time = room.get('check_in_detail')
+                check_out_time = room.get('check_out_detail')
+                device_name = room.get('device_name')
+                
+                # 使用雪花算法生成唯一ID
+                record_id = next(gen)
+                
+                # 异常时间
+                abnormal_time = room.get('abnormal_time')
+                
+                # 设置默认值
+                electricity_usage_status = '异常'
+                power_consumption = 0.000  # 可以根据实际情况修改
+                estimated_cost = 0.00      # 可以根据实际情况修改
+                
+                # 构建SQL插入语句
+                insert_sql = """
+                    INSERT INTO abnormal_electricity_usage (
+                        id, dept_name, dept_id, dept_brand, room_num, 
+                        device_name, room_status, check_in_time, check_out_time,
+                        electricity_usage_status, abnormal_time, 
+                        power_consumption, estimated_electricity_cost
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, 
+                        %s, %s, %s, %s, 
+                        %s, %s, 
+                        %s, %s
+                    )
+                """
+                
+                # 准备参数
+                params = (
+                    str(record_id), dept_name, dept_code, dept_brand, room_num,
+                    device_name, room_status, check_in_time, check_out_time,
+                    electricity_usage_status, abnormal_time,
+                    power_consumption, estimated_cost
+                )
+                
+                # 执行插入
+                try:
+                    cursor.execute(insert_sql, params)
+                    saved_count += 1
+                    # print(f"成功保存房间记录: 部门={dept_name}, 房间={room_num}, 状态={original_status}({room_status})")
+                    
+                    # 创建用于飞书发送的JSON记录
+                    json_record = {
+                        "id": str(record_id),
+                        "dept_name": dept_name,
+                        "dept_id": dept_code,
+                        "dept_brand": dept_brand,
+                        "room_num": room_num,
+                        "device_name": device_name,
+                        "room_status": room_status,
+                        "check_in_time": check_in_time,
+                        "check_out_time": check_out_time,
+                        "electricity_usage_status": electricity_usage_status,
+                        "abnormal_time": abnormal_time,
+                        "power_consumption": power_consumption,
+                        "estimated_electricity_cost": estimated_cost
+                    }
+                    json_records.append(json_record)
+                    
+                except Exception as e:
+                    print(f"保存房间记录失败: 部门={dept_name}, 房间={room_num}, 状态={original_status}({room_status}), 错误: {e}")
+        
+        # 提交事务
+        conn.commit()
+        print(f"数据保存完成，共保存 {saved_count} 条记录")
+        
+        # 关闭连接
+        cursor.close()
+        conn.close()
+        
+    except pymysql.OperationalError as e:
+        print(f"数据库连接错误: {e}")
+    except Exception as e:
+        print(f"保存数据时出现未知错误: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # 返回保存的记录数和JSON记录列表
+    return saved_count, json_records
 
 
-def send_to_feishu(json_data):
+def send_to_feishu(json_records):
     """
     向飞书发送数据
-    :param json_data: 要发送的JSON数据
+    :param json_records: 要发送的JSON数据列表，来自save_to_mysql函数的第二个返回值
     :return: 是否发送成功
     """
+    if not json_records or not isinstance(json_records, list):
+        print("没有有效数据需要发送到飞书")
+        return False
 
-    json_data['type'] = 'electricalAnomaly'
+    # 构建发送数据
+    payload = {
+        "records": json_records,
+        "type": "electricalAnomaly"
+    }
 
     # 飞书机器人webhook地址
     url = 'https://open.feishu.cn/anycross/trigger/callback/MDA0ZTdmZTVhNzkzY2U5YjE5NTY2NGJiODk0OWJiM2U3'
 
     try:
-        print(f"开始向飞书发送数据...")
+        print(f"开始向飞书发送数据，共 {len(json_records)} 条记录...")
         # 准备请求头
         headers = {
             'Content-Type': 'application/json',
@@ -951,32 +1103,38 @@ def send_to_feishu(json_data):
         }
 
         # 转换数据为JSON字符串
-        if not isinstance(json_data, str):
-            json_data = json.dumps(json_data, ensure_ascii=False)
+        json_data = json.dumps(payload, ensure_ascii=False)
 
         # 发送POST请求
         response = requests.post(url, headers=headers, data=json_data.encode('utf-8'), timeout=10)
 
         # 检查响应状态
         if response.status_code == 200:
-            result = response.json()
-            if result.get('code') == 0:
-                print(f"成功发送到飞书: {response.status_code}")
+            # 尝试解析响应内容为JSON
+            try:
+                result = response.json()
+                # 检查是否包含challenge字段(飞书API特殊响应格式)
+                if 'challenge' in result or result.get('code') == 0:
+                    print(f"成功发送到飞书")
+                    return True
+                else:
+                    print(f"飞书接口返回未识别的响应: {result}")
+            except json.JSONDecodeError:
+                # 如果无法解析为JSON，但状态码是200，依然认为是成功的
+                print(f"飞书接口返回非JSON响应，但状态码为200，视为成功")
                 return True
-            else:
-                print(f"飞书接口返回错误: {result.get('msg', '未知错误')}")
         else:
             print(f"发送失败，HTTP状态码: {response.status_code}")
 
-        # 调试信息
-        print(f"响应内容: {response.text}")
+        # 输出详细响应内容以便调试
+        print(f"响应详情: {response.text}")
 
     except requests.RequestException as e:
         print(f"发送请求出错: {e}")
-    except json.JSONDecodeError:
-        print(f"JSON解析错误")
     except Exception as e:
         print(f"发送过程中出现未知错误: {e}")
+        import traceback
+        traceback.print_exc()
 
     return False
 
@@ -992,6 +1150,7 @@ if __name__ == "__main__":
 
     print("开始获取数据...")
     # res_data = fetch_smart_meter_products()
+    # print(res_data)
     # print(f"获取数据结果: {res_data['product_keys']}")
     # print(f"数据结构: {list(res_data.keys())}")
 
@@ -1000,11 +1159,20 @@ if __name__ == "__main__":
     print("\n开始数据预测...")
     # prediction_result = data_prediction(res_data)
     # print(prediction_result)
-    tm={'a1KBbjGM3vc': {'abnormal': {'1417': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 2359.8, 'baseline_mean': 440.86875000000003, 'baseline_std': 879.9119023011166, 'hourly_consumption': 0.3480041135238053}, 'prediction': {'expected': 440.86875000000003, 'lower_bound': 0, 'upper_bound': 1320.7806523011166, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:51:20'}, '1439': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 2055.7, 'baseline_mean': 518.1291666666667, 'baseline_std': 896.8390977295271, 'hourly_consumption': 0.03655319148935845}, 'prediction': {'expected': 518.1291666666667, 'lower_bound': 0, 'upper_bound': 1414.9682643961937, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:36:50'}, '1418': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 2346.2, 'baseline_mean': 698.7395833333334, 'baseline_std': 592.5560017486391, 'hourly_consumption': 0.6184680851063777}, 'prediction': {'expected': 698.7395833333334, 'lower_bound': 106.18358158469425, 'upper_bound': 1291.2955850819726, 'confidence': 0.68}, 'timestamp': '2025-02-26 12:33:33'}}, 'normal': {'1425': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 21.2, 'baseline_mean': 585.9354166666667, 'baseline_std': 605.6008525000265, 'hourly_consumption': 0.5377084835518137}, 'prediction': {'expected': 585.9354166666667, 'lower_bound': 0, 'upper_bound': 1191.5362691666933, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:58'}, '1422': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 196.2, 'baseline_mean': 480.9833333333338, 'baseline_std': 818.9718843622695, 'hourly_consumption': 0.44089361702127133}, 'prediction': {'expected': 480.9833333333338, 'lower_bound': 0, 'upper_bound': 1299.9552176956033, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:56:18'}, '1409': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 13.6, 'baseline_mean': 284.0416666666667, 'baseline_std': 613.7063639931345, 'hourly_consumption': 0.2682553191489302}, 'prediction': {'expected': 284.0416666666667, 'lower_bound': 0, 'upper_bound': 897.7480306598011, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:32:45'}, '1435': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 226.2, 'baseline_mean': 605.4145833333333, 'baseline_std': 549.3484581813311, 'hourly_consumption': 0.6233617021276547}, 'prediction': {'expected': 605.4145833333333, 'lower_bound': 56.0661251520022, 'upper_bound': 1154.7630415146646, 'confidence': 0.68}, 'timestamp': '2025-02-26 13:37:18'}, '1315': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.6, 'baseline_mean': 1080.0041666666664, 'baseline_std': 1049.6987069161412, 'hourly_consumption': 1.0682127659574496}, 'prediction': {'expected': 1080.0041666666664, 'lower_bound': 30.305459750525188, 'upper_bound': 2129.7028735828076, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:58:04'}, '1405': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 11.2, 'baseline_mean': 958.2583333333326, 'baseline_std': 1344.4034316986547, 'hourly_consumption': 0.8417546306693912}, 'prediction': {'expected': 958.2583333333326, 'lower_bound': 0, 'upper_bound': 2302.661765031987, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:38:30'}, '1431': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 7.7, 'baseline_mean': 284.24375000000015, 'baseline_std': 396.0921179694858, 'hourly_consumption': 0.5519639712053336}, 'prediction': {'expected': 284.24375000000015, 'lower_bound': 0, 'upper_bound': 680.3358679694859, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:01'}, '1302': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 9.2, 'baseline_mean': 1339.5041666666664, 'baseline_std': 970.7937552855489, 'hourly_consumption': 0.8683081360299852}, 'prediction': {'expected': 1339.5041666666664, 'lower_bound': 368.7104113811175, 'upper_bound': 2310.2979219522153, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:49:13'}, '1306': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.0, 'baseline_mean': 375.18333333333334, 'baseline_std': 811.9851427561575, 'hourly_consumption': 0.1150212765957436}, 'prediction': {'expected': 375.18333333333334, 'lower_bound': 0, 'upper_bound': 1187.168476089491, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:20'}, '1403': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.8, 'baseline_mean': 551.1624999999996, 'baseline_std': 1241.1084461720397, 'hourly_consumption': 0.4873617021276585}, 'prediction': {'expected': 551.1624999999996, 'lower_bound': 0, 'upper_bound': 1792.2709461720392, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:37:55'}, '1419': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 198.5, 'baseline_mean': 286.49791666666687, 'baseline_std': 809.809233771726, 'hourly_consumption': 0.2061300961004192}, 'prediction': {'expected': 286.49791666666687, 'lower_bound': 0, 'upper_bound': 1096.307150438393, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:54'}, '1312': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 221.7, 'baseline_mean': 1198.2312499999998, 'baseline_std': 1239.4198933296911, 'hourly_consumption': 0.9187342639983793}, 'prediction': {'expected': 1198.2312499999998, 'lower_bound': 0, 'upper_bound': 2437.651143329691, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:25:51'}, '1415': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 68.5, 'baseline_mean': 128.20000000000002, 'baseline_std': 432.14687515025213, 'hourly_consumption': 0.10438421257934383}, 'prediction': {'expected': 128.20000000000002, 'lower_bound': 0, 'upper_bound': 560.3468751502521, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:00'}, '1311': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 215.4, 'baseline_mean': 580.2812499999999, 'baseline_std': 927.9098754054725, 'hourly_consumption': 0.4658297872340282}, 'prediction': {'expected': 580.2812499999999, 'lower_bound': 0, 'upper_bound': 1508.1911254054723, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:44:26'}, '1406': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 31.3, 'baseline_mean': 1440.7791666666678, 'baseline_std': 1100.5055122694578, 'hourly_consumption': 0.07651063829786274}, 'prediction': {'expected': 1440.7791666666678, 'lower_bound': 340.27365439721007, 'upper_bound': 2541.2846789361256, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:57:55'}, '1421': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 205.1, 'baseline_mean': 604.9625, 'baseline_std': 737.6994771340359, 'hourly_consumption': 0.5065106382978635}, 'prediction': {'expected': 604.9625, 'lower_bound': 0, 'upper_bound': 1342.6619771340359, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:51:00'}, '1412': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 13.5, 'baseline_mean': 158.06249999999997, 'baseline_std': 445.3767182027157, 'hourly_consumption': 0.19821510892564292}, 'prediction': {'expected': 158.06249999999997, 'lower_bound': 0, 'upper_bound': 603.4392182027157, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:38:41'}}}, 'a1bboFh9ffy': {'abnormal': {'20布草间': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 1116.2, 'baseline_mean': 600.5558139534885, 'baseline_std': 280.06676355598944, 'hourly_consumption': 0.568483710101985}, 'prediction': {'expected': 600.5558139534885, 'lower_bound': 320.48905039749906, 'upper_bound': 880.6225775094779, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:46:27'}, '21层布草间': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 939.7, 'baseline_mean': 526.9744186046513, 'baseline_std': 237.7690557112523, 'hourly_consumption': 0.5310952380952391}, 'prediction': {'expected': 526.9744186046513, 'lower_bound': 289.205362893399, 'upper_bound': 764.7434743159035, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:32:01'}}, 'normal': {'2107': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.2, 'baseline_mean': 8.25348837209302, 'baseline_std': 0.12601745383515886, 'hourly_consumption': 0.00804761904761907}, 'prediction': {'expected': 8.25348837209302, 'lower_bound': 8.127470918257861, 'upper_bound': 8.37950582592818, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:05'}, '2109': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.1, 'baseline_mean': 10.32093023255814, 'baseline_std': 0.3203852885384243, 'hourly_consumption': 0.01014272297985481}, 'prediction': {'expected': 10.32093023255814, 'lower_bound': 10.000544944019715, 'upper_bound': 10.641315521096566, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:31:57'}, '2125': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.1, 'baseline_mean': 8.211627906976743, 'baseline_std': 0.1095647282607333, 'hourly_consumption': 0.00819047619047605}, 'prediction': {'expected': 8.211627906976743, 'lower_bound': 8.102063178716008, 'upper_bound': 8.321192635237477, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:55'}, '1929': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 0.0, 'baseline_mean': 0.0, 'baseline_std': 0.0, 'hourly_consumption': 0.0}, 'prediction': {'expected': 0.0, 'lower_bound': 0, 'upper_bound': 0.0, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:43:41'}, '2121': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.5, 'baseline_mean': 10.360465116279073, 'baseline_std': 0.25832752824542515, 'hourly_consumption': 0.01038095238095238}, 'prediction': {'expected': 10.360465116279073, 'lower_bound': 10.102137588033647, 'upper_bound': 10.618792644524499, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:13'}, '2122': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.2, 'baseline_mean': 8.281395348837208, 'baseline_std': 0.09064796888825459, 'hourly_consumption': 0.00823809523809524}, 'prediction': {'expected': 8.281395348837208, 'lower_bound': 8.190747379948954, 'upper_bound': 8.372043317725462, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:11'}, '2106': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 9.0, 'baseline_mean': 8.937209302325583, 'baseline_std': 0.07874992309581551, 'hourly_consumption': 0.008761904761904728}, 'prediction': {'expected': 8.937209302325583, 'lower_bound': 8.858459379229767, 'upper_bound': 9.015959225421398, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:05'}, '2006': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.6, 'baseline_mean': 10.285714285714285, 'baseline_std': 0.36396959707621, 'hourly_consumption': 0.0102450592885376}, 'prediction': {'expected': 10.285714285714285, 'lower_bound': 9.921744688638075, 'upper_bound': 10.649683882790494, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:51:10'}, '1905': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 1.0, 'baseline_mean': 1.0511627906976748, 'baseline_std': 0.059249645461088435, 'hourly_consumption': 0.0}, 'prediction': {'expected': 1.0511627906976748, 'lower_bound': 0.9919131452365864, 'upper_bound': 1.1104124361587633, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:43:43'}, '1926': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 0.0, 'baseline_mean': 0.0, 'baseline_std': 0.0, 'hourly_consumption': 0.0}, 'prediction': {'expected': 0.0, 'lower_bound': 0, 'upper_bound': 0.0, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:44:25'}, '1901': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 1.0, 'baseline_mean': 1.0418604651162793, 'baseline_std': 0.06630577845799998, 'hourly_consumption': 0.0}, 'prediction': {'expected': 1.0418604651162793, 'lower_bound': 0.9755546866582793, 'upper_bound': 1.1081662435742792, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:44:21'}, '2002': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.0, 'baseline_mean': 23.539534883720936, 'baseline_std': 42.68261126665543, 'hourly_consumption': 0.014714285714285595}, 'prediction': {'expected': 23.539534883720936, 'lower_bound': 0, 'upper_bound': 66.22214615037636, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:51:48'}, '2119': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.3, 'baseline_mean': 8.362790697674418, 'baseline_std': 0.06554989308027105, 'hourly_consumption': 0.00842857142857141}, 'prediction': {'expected': 8.362790697674418, 'lower_bound': 8.297240804594146, 'upper_bound': 8.42834059075469, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:11'}, '1922': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.2, 'baseline_mean': 9.981395348837209, 'baseline_std': 0.4831719668002905, 'hourly_consumption': 0.01004775195439086}, 'prediction': {'expected': 9.981395348837209, 'lower_bound': 9.498223382036919, 'upper_bound': 10.464567315637499, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:45:07'}, '2011': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 5.2, 'baseline_mean': 5.149999999999998, 'baseline_std': 0.07407971974871934, 'hourly_consumption': 0.005000066138441174}, 'prediction': {'expected': 5.149999999999998, 'lower_bound': 5.075920280251278, 'upper_bound': 5.224079719748717, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:33:15'}, '2001': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.4, 'baseline_mean': 8.465116279069766, 'baseline_std': 0.10208241518786142, 'hourly_consumption': 0.008333443564068174}, 'prediction': {'expected': 8.465116279069766, 'lower_bound': 8.363033863881904, 'upper_bound': 8.567198694257629, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:31:02'}, '2020': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.4, 'baseline_mean': 10.214285714285714, 'baseline_std': 0.40277781115249434, 'hourly_consumption': 0.0102380952380954}, 'prediction': {'expected': 10.214285714285714, 'lower_bound': 9.811507903133219, 'upper_bound': 10.617063525438208, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:55:14'}, '2123': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 18.7, 'baseline_mean': 18.495348837209313, 'baseline_std': 0.44718883215679545, 'hourly_consumption': 0.018428815195968222}, 'prediction': {'expected': 18.495348837209313, 'lower_bound': 18.04816000505252, 'upper_bound': 18.942537669366107, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:19'}, '2012': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 5.1, 'baseline_mean': 5.0953488372093005, 'baseline_std': 0.17314113204481074, 'hourly_consumption': 0.004952380952380915}, 'prediction': {'expected': 5.0953488372093005, 'lower_bound': 4.92220770516449, 'upper_bound': 5.268489969254111, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:31:11'}, '2008': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 4.9, 'baseline_mean': 5.030232558139534, 'baseline_std': 0.09888637953523118, 'hourly_consumption': 0.0050476190476194645}, 'prediction': {'expected': 5.030232558139534, 'lower_bound': 4.931346178604303, 'upper_bound': 5.1291189376747655, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:52:31'}, '2112': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.2, 'baseline_mean': 8.220930232558137, 'baseline_std': 0.08035083646965518, 'hourly_consumption': 0.013523809523809558}, 'prediction': {'expected': 8.220930232558137, 'lower_bound': 8.140579396088482, 'upper_bound': 8.301281069027793, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:11'}, '2029': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.6, 'baseline_mean': 10.406976744186048, 'baseline_std': 0.6449050682583738, 'hourly_consumption': 0.010238095238094724}, 'prediction': {'expected': 10.406976744186048, 'lower_bound': 9.762071675927674, 'upper_bound': 11.051881812444423, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:46:50'}, '2032': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.4, 'baseline_mean': 8.500000000000002, 'baseline_std': 0.20976176963402998, 'hourly_consumption': 0.008571938805879597}, 'prediction': {'expected': 8.500000000000002, 'lower_bound': 8.290238230365972, 'upper_bound': 8.709761769634031, 'confidence': 0.68}, 'timestamp': '2025-02-25 22:31:29'}, '2021': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.3, 'baseline_mean': 8.392857142857148, 'baseline_std': 0.1967948754325569, 'hourly_consumption': 0.00843891004186944}, 'prediction': {'expected': 8.392857142857148, 'lower_bound': 8.19606226742459, 'upper_bound': 8.589652018289705, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:39:03'}, '2111': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.2, 'baseline_mean': 8.14418604651163, 'baseline_std': 0.17902158101003118, 'hourly_consumption': 0.008095238095238091}, 'prediction': {'expected': 8.14418604651163, 'lower_bound': 7.965164465501599, 'upper_bound': 8.323207627521661, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:11'}}}, 'a1Q4MNc2hZ0': {'abnormal': {'1112': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 591.6, 'baseline_mean': 466.54166666666674, 'baseline_std': 448.22924692775064, 'hourly_consumption': 0.41276107847425164}, 'prediction': {'expected': 466.54166666666674, 'lower_bound': 18.312419738916105, 'upper_bound': 914.7709135944174, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:24'}, '1125': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 1015.0, 'baseline_mean': 81.12916666666668, 'baseline_std': 215.95439329235583, 'hourly_consumption': 0.12199855793667062}, 'prediction': {'expected': 81.12916666666668, 'lower_bound': 0, 'upper_bound': 297.0835599590225, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:35:14'}, '1105': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 1024.4, 'baseline_mean': 871.25625, 'baseline_std': 244.24198229942618, 'hourly_consumption': 0.9724991430361409}, 'prediction': {'expected': 871.25625, 'lower_bound': 627.0142677005738, 'upper_bound': 1115.4982322994263, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:48:08'}}, 'normal': {'1122': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 337.3, 'baseline_mean': 1000.9375000000003, 'baseline_std': 598.0666417093765, 'hourly_consumption': 0.92672340425532}, 'prediction': {'expected': 1000.9375000000003, 'lower_bound': 402.8708582906238, 'upper_bound': 1599.0041417093769, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:44:45'}, '1222': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 9.3, 'baseline_mean': 528.6583333333333, 'baseline_std': 864.4682354730243, 'hourly_consumption': 0.5163404255319155}, 'prediction': {'expected': 528.6583333333333, 'lower_bound': 0, 'upper_bound': 1393.1265688063577, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:52:15'}, '1108': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 15.8, 'baseline_mean': 290.4270833333333, 'baseline_std': 473.00652990840706, 'hourly_consumption': 0.38114893617021733}, 'prediction': {'expected': 290.4270833333333, 'lower_bound': 0, 'upper_bound': 763.4336132417404, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:53:30'}, '1121': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 6.0, 'baseline_mean': 274.3374999999999, 'baseline_std': 405.9758056018147, 'hourly_consumption': 0.3166808510638301}, 'prediction': {'expected': 274.3374999999999, 'lower_bound': 0, 'upper_bound': 680.3133056018146, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:55:20'}, '1216': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 36.9, 'baseline_mean': 500.1333333333334, 'baseline_std': 832.4259219059632, 'hourly_consumption': 0.5089727071784027}, 'prediction': {'expected': 500.1333333333334, 'lower_bound': 0, 'upper_bound': 1332.5592552392966, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:56:26'}, '1219': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 1243.8, 'baseline_mean': 1371.4687499999998, 'baseline_std': 146.74887241764776, 'hourly_consumption': 1.4058131700570928}, 'prediction': {'expected': 1371.4687499999998, 'lower_bound': 1224.719877582352, 'upper_bound': 1518.2176224176476, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:33:16'}, '1116': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 728.6, 'baseline_mean': 896.0250000000001, 'baseline_std': 950.7370159009566, 'hourly_consumption': 0.8826704176073591}, 'prediction': {'expected': 896.0250000000001, 'lower_bound': 0, 'upper_bound': 1846.7620159009566, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:41:14'}, '1109': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 33.0, 'baseline_mean': 1379.254166666666, 'baseline_std': 1205.6533064282696, 'hourly_consumption': 1.3662391697497653}, 'prediction': {'expected': 1379.254166666666, 'lower_bound': 173.6008602383963, 'upper_bound': 2584.9074730949355, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:11'}, '1208': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 4.5, 'baseline_mean': 4.612499999999998, 'baseline_std': 0.08410985724102968, 'hourly_consumption': 0.08318952270631591}, 'prediction': {'expected': 4.612499999999998, 'lower_bound': 4.528390142758968, 'upper_bound': 4.696609857241028, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:57:19'}, '1102': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 15.7, 'baseline_mean': 640.0125000000002, 'baseline_std': 826.1795437819977, 'hourly_consumption': 0.5298660772331295}, 'prediction': {'expected': 640.0125000000002, 'lower_bound': 0, 'upper_bound': 1466.1920437819979, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:57:33'}, '1212': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 9.0, 'baseline_mean': 855.0249999999996, 'baseline_std': 1081.90299787389, 'hourly_consumption': 0.8774042553191477}, 'prediction': {'expected': 855.0249999999996, 'lower_bound': 0, 'upper_bound': 1936.9279978738896, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:47:20'}}}, 'a1hMUeoBSiK': {'abnormal': {'8902': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 1508.0, 'baseline_mean': 1277.8291666666664, 'baseline_std': 917.3206585597906, 'hourly_consumption': 1.2786534119788748}, 'prediction': {'expected': 1277.8291666666664, 'lower_bound': 360.50850810687587, 'upper_bound': 2195.149825226457, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:18:25'}}, 'normal': {'8918': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 32.2, 'baseline_mean': 78.14791666666662, 'baseline_std': 316.3318033059612, 'hourly_consumption': 0.09574694437220738}, 'prediction': {'expected': 78.14791666666662, 'lower_bound': 0, 'upper_bound': 394.47971997262783, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:52:38'}, '8903': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 784.1, 'baseline_mean': 999.9354166666666, 'baseline_std': 448.69445391523493, 'hourly_consumption': 1.0747062578311493}, 'prediction': {'expected': 999.9354166666666, 'lower_bound': 551.2409627514317, 'upper_bound': 1448.6298705819015, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:03'}, '8912': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 148.4, 'baseline_mean': 1091.3500000000001, 'baseline_std': 649.0793827463502, 'hourly_consumption': 1.1760139008735315}, 'prediction': {'expected': 1091.3500000000001, 'lower_bound': 442.2706172536499, 'upper_bound': 1740.4293827463503, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:37:42'}, '8933': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 75.3, 'baseline_mean': 1027.64375, 'baseline_std': 1120.1172001570935, 'hourly_consumption': 1.0139268785683047}, 'prediction': {'expected': 1027.64375, 'lower_bound': 0, 'upper_bound': 2147.7609501570932, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:17:07'}, '8921': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 197.4, 'baseline_mean': 320.68541666666675, 'baseline_std': 551.3269671224313, 'hourly_consumption': 0.2962162673317657}, 'prediction': {'expected': 320.68541666666675, 'lower_bound': 0, 'upper_bound': 872.0123837890981, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:35:10'}, '8929': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 183.5, 'baseline_mean': 688.94375, 'baseline_std': 868.7703461952367, 'hourly_consumption': 0.7466896771829465}, 'prediction': {'expected': 688.94375, 'lower_bound': 0, 'upper_bound': 1557.7140961952368, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:00:10'}, '8915': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 14.8, 'baseline_mean': 252.54374999999985, 'baseline_std': 486.5002726404737, 'hourly_consumption': 0.30622000520106485}, 'prediction': {'expected': 252.54374999999985, 'lower_bound': 0, 'upper_bound': 739.0440226404736, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:37:47'}, '8906': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 11.0, 'baseline_mean': 659.6020833333336, 'baseline_std': 1181.090458547593, 'hourly_consumption': 0.6497098074445337}, 'prediction': {'expected': 659.6020833333336, 'lower_bound': 0, 'upper_bound': 1840.6925418809265, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:31:13'}, '8917': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 132.9, 'baseline_mean': 1233.547916666667, 'baseline_std': 658.3799947161029, 'hourly_consumption': 1.3379307084008099}, 'prediction': {'expected': 1233.547916666667, 'lower_bound': 575.1679219505642, 'upper_bound': 1891.9279113827702, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:41:50'}, '8923': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 11.2, 'baseline_mean': 642.5791666666668, 'baseline_std': 286.6399364599407, 'hourly_consumption': 0.6973273915767398}, 'prediction': {'expected': 642.5791666666668, 'lower_bound': 355.93923020672605, 'upper_bound': 929.2191031266075, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:50:27'}, '8907': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 14.7, 'baseline_mean': 565.8791666666665, 'baseline_std': 591.6717045285471, 'hourly_consumption': 0.6177094291894736}, 'prediction': {'expected': 565.8791666666665, 'lower_bound': 0, 'upper_bound': 1157.5508711952136, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:40:11'}, '8928': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 284.8, 'baseline_mean': 1096.3673913043478, 'baseline_std': 688.6930501736517, 'hourly_consumption': 1.198879406132523}, 'prediction': {'expected': 1096.3673913043478, 'lower_bound': 407.6743411306961, 'upper_bound': 1785.0604414779996, 'confidence': 0.68}, 'timestamp': '2025-02-26 12:22:20'}, '8909': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 72.4, 'baseline_mean': 1437.0041666666664, 'baseline_std': 600.4305582674972, 'hourly_consumption': 1.4991241031217786}, 'prediction': {'expected': 1437.0041666666664, 'lower_bound': 836.5736083991692, 'upper_bound': 2037.4347249341636, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:52:30'}, '8911': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 1105.9, 'baseline_mean': 1098.39375, 'baseline_std': 635.2821418451335, 'hourly_consumption': 1.0503102873556431}, 'prediction': {'expected': 1098.39375, 'lower_bound': 463.1116081548664, 'upper_bound': 1733.6758918451335, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:41:01'}, '8936': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 20.9, 'baseline_mean': 601.0749999999999, 'baseline_std': 791.030341968558, 'hourly_consumption': 0.7225191787137079}, 'prediction': {'expected': 601.0749999999999, 'lower_bound': 0, 'upper_bound': 1392.105341968558, 'confidence': 0.68}, 'timestamp': '2025-02-26 13:56:00'}, '8901': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 25.7, 'baseline_mean': 832.3187499999998, 'baseline_std': 774.8687695774615, 'hourly_consumption': 0.9193300157212182}, 'prediction': {'expected': 832.3187499999998, 'lower_bound': 57.44998042253826, 'upper_bound': 1607.1875195774614, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:47:44'}, '8927': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 338.4, 'baseline_mean': 763.4874999999998, 'baseline_std': 766.1812453274288, 'hourly_consumption': 0.8495419567607351}, 'prediction': {'expected': 763.4874999999998, 'lower_bound': 0, 'upper_bound': 1529.6687453274285, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:56:39'}, '8930': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 19.9, 'baseline_mean': 251.39583333333323, 'baseline_std': 603.7751226290079, 'hourly_consumption': 0.21123903638383637}, 'prediction': {'expected': 251.39583333333323, 'lower_bound': 0, 'upper_bound': 855.1709559623412, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:40:18'}, '8905': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 71.1, 'baseline_mean': 727.9833333333332, 'baseline_std': 1052.6630938139774, 'hourly_consumption': 0.7144849760041593}, 'prediction': {'expected': 727.9833333333332, 'lower_bound': 0, 'upper_bound': 1780.6464271473105, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:57:25'}}}}
-    # dept_room_num=find_dept_id(tm)
+    prediction_result={'a1KBbjGM3vc': {'abnormal': {'1417': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 2359.8, 'baseline_mean': 440.86875000000003, 'baseline_std': 879.9119023011166, 'hourly_consumption': 0.3480041135238053}, 'prediction': {'expected': 440.86875000000003, 'lower_bound': 0, 'upper_bound': 1320.7806523011166, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:51:20'}, '1439': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 2055.7, 'baseline_mean': 518.1291666666667, 'baseline_std': 896.8390977295271, 'hourly_consumption': 0.03655319148935845}, 'prediction': {'expected': 518.1291666666667, 'lower_bound': 0, 'upper_bound': 1414.9682643961937, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:36:50'}, '1418': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 2346.2, 'baseline_mean': 698.7395833333334, 'baseline_std': 592.5560017486391, 'hourly_consumption': 0.6184680851063777}, 'prediction': {'expected': 698.7395833333334, 'lower_bound': 106.18358158469425, 'upper_bound': 1291.2955850819726, 'confidence': 0.68}, 'timestamp': '2025-02-26 12:33:33'}}, 'normal': {'1425': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 21.2, 'baseline_mean': 585.9354166666667, 'baseline_std': 605.6008525000265, 'hourly_consumption': 0.5377084835518137}, 'prediction': {'expected': 585.9354166666667, 'lower_bound': 0, 'upper_bound': 1191.5362691666933, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:58'}, '1422': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 196.2, 'baseline_mean': 480.9833333333338, 'baseline_std': 818.9718843622695, 'hourly_consumption': 0.44089361702127133}, 'prediction': {'expected': 480.9833333333338, 'lower_bound': 0, 'upper_bound': 1299.9552176956033, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:56:18'}, '1409': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 13.6, 'baseline_mean': 284.0416666666667, 'baseline_std': 613.7063639931345, 'hourly_consumption': 0.2682553191489302}, 'prediction': {'expected': 284.0416666666667, 'lower_bound': 0, 'upper_bound': 897.7480306598011, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:32:45'}, '1435': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 226.2, 'baseline_mean': 605.4145833333333, 'baseline_std': 549.3484581813311, 'hourly_consumption': 0.6233617021276547}, 'prediction': {'expected': 605.4145833333333, 'lower_bound': 56.0661251520022, 'upper_bound': 1154.7630415146646, 'confidence': 0.68}, 'timestamp': '2025-02-26 13:37:18'}, '1315': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.6, 'baseline_mean': 1080.0041666666664, 'baseline_std': 1049.6987069161412, 'hourly_consumption': 1.0682127659574496}, 'prediction': {'expected': 1080.0041666666664, 'lower_bound': 30.305459750525188, 'upper_bound': 2129.7028735828076, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:58:04'}, '1405': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 11.2, 'baseline_mean': 958.2583333333326, 'baseline_std': 1344.4034316986547, 'hourly_consumption': 0.8417546306693912}, 'prediction': {'expected': 958.2583333333326, 'lower_bound': 0, 'upper_bound': 2302.661765031987, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:38:30'}, '1431': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 7.7, 'baseline_mean': 284.24375000000015, 'baseline_std': 396.0921179694858, 'hourly_consumption': 0.5519639712053336}, 'prediction': {'expected': 284.24375000000015, 'lower_bound': 0, 'upper_bound': 680.3358679694859, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:01'}, '1302': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 9.2, 'baseline_mean': 1339.5041666666664, 'baseline_std': 970.7937552855489, 'hourly_consumption': 0.8683081360299852}, 'prediction': {'expected': 1339.5041666666664, 'lower_bound': 368.7104113811175, 'upper_bound': 2310.2979219522153, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:49:13'}, '1306': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.0, 'baseline_mean': 375.18333333333334, 'baseline_std': 811.9851427561575, 'hourly_consumption': 0.1150212765957436}, 'prediction': {'expected': 375.18333333333334, 'lower_bound': 0, 'upper_bound': 1187.168476089491, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:20'}, '1403': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.8, 'baseline_mean': 551.1624999999996, 'baseline_std': 1241.1084461720397, 'hourly_consumption': 0.4873617021276585}, 'prediction': {'expected': 551.1624999999996, 'lower_bound': 0, 'upper_bound': 1792.2709461720392, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:37:55'}, '1419': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 198.5, 'baseline_mean': 286.49791666666687, 'baseline_std': 809.809233771726, 'hourly_consumption': 0.2061300961004192}, 'prediction': {'expected': 286.49791666666687, 'lower_bound': 0, 'upper_bound': 1096.307150438393, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:54'}, '1312': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 221.7, 'baseline_mean': 1198.2312499999998, 'baseline_std': 1239.4198933296911, 'hourly_consumption': 0.9187342639983793}, 'prediction': {'expected': 1198.2312499999998, 'lower_bound': 0, 'upper_bound': 2437.651143329691, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:25:51'}, '1415': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 68.5, 'baseline_mean': 128.20000000000002, 'baseline_std': 432.14687515025213, 'hourly_consumption': 0.10438421257934383}, 'prediction': {'expected': 128.20000000000002, 'lower_bound': 0, 'upper_bound': 560.3468751502521, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:00'}, '1311': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 215.4, 'baseline_mean': 580.2812499999999, 'baseline_std': 927.9098754054725, 'hourly_consumption': 0.4658297872340282}, 'prediction': {'expected': 580.2812499999999, 'lower_bound': 0, 'upper_bound': 1508.1911254054723, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:44:26'}, '1406': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 31.3, 'baseline_mean': 1440.7791666666678, 'baseline_std': 1100.5055122694578, 'hourly_consumption': 0.07651063829786274}, 'prediction': {'expected': 1440.7791666666678, 'lower_bound': 340.27365439721007, 'upper_bound': 2541.2846789361256, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:57:55'}, '1421': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 205.1, 'baseline_mean': 604.9625, 'baseline_std': 737.6994771340359, 'hourly_consumption': 0.5065106382978635}, 'prediction': {'expected': 604.9625, 'lower_bound': 0, 'upper_bound': 1342.6619771340359, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:51:00'}, '1412': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 13.5, 'baseline_mean': 158.06249999999997, 'baseline_std': 445.3767182027157, 'hourly_consumption': 0.19821510892564292}, 'prediction': {'expected': 158.06249999999997, 'lower_bound': 0, 'upper_bound': 603.4392182027157, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:38:41'}}}, 'a1bboFh9ffy': {'abnormal': {'20布草间': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 1116.2, 'baseline_mean': 600.5558139534885, 'baseline_std': 280.06676355598944, 'hourly_consumption': 0.568483710101985}, 'prediction': {'expected': 600.5558139534885, 'lower_bound': 320.48905039749906, 'upper_bound': 880.6225775094779, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:46:27'}, '21层布草间': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 939.7, 'baseline_mean': 526.9744186046513, 'baseline_std': 237.7690557112523, 'hourly_consumption': 0.5310952380952391}, 'prediction': {'expected': 526.9744186046513, 'lower_bound': 289.205362893399, 'upper_bound': 764.7434743159035, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:32:01'}}, 'normal': {'2107': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.2, 'baseline_mean': 8.25348837209302, 'baseline_std': 0.12601745383515886, 'hourly_consumption': 0.00804761904761907}, 'prediction': {'expected': 8.25348837209302, 'lower_bound': 8.127470918257861, 'upper_bound': 8.37950582592818, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:05'}, '2109': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.1, 'baseline_mean': 10.32093023255814, 'baseline_std': 0.3203852885384243, 'hourly_consumption': 0.01014272297985481}, 'prediction': {'expected': 10.32093023255814, 'lower_bound': 10.000544944019715, 'upper_bound': 10.641315521096566, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:31:57'}, '2125': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.1, 'baseline_mean': 8.211627906976743, 'baseline_std': 0.1095647282607333, 'hourly_consumption': 0.00819047619047605}, 'prediction': {'expected': 8.211627906976743, 'lower_bound': 8.102063178716008, 'upper_bound': 8.321192635237477, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:55'}, '1929': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 0.0, 'baseline_mean': 0.0, 'baseline_std': 0.0, 'hourly_consumption': 0.0}, 'prediction': {'expected': 0.0, 'lower_bound': 0, 'upper_bound': 0.0, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:43:41'}, '2121': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.5, 'baseline_mean': 10.360465116279073, 'baseline_std': 0.25832752824542515, 'hourly_consumption': 0.01038095238095238}, 'prediction': {'expected': 10.360465116279073, 'lower_bound': 10.102137588033647, 'upper_bound': 10.618792644524499, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:13'}, '2122': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.2, 'baseline_mean': 8.281395348837208, 'baseline_std': 0.09064796888825459, 'hourly_consumption': 0.00823809523809524}, 'prediction': {'expected': 8.281395348837208, 'lower_bound': 8.190747379948954, 'upper_bound': 8.372043317725462, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:11'}, '2106': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 9.0, 'baseline_mean': 8.937209302325583, 'baseline_std': 0.07874992309581551, 'hourly_consumption': 0.008761904761904728}, 'prediction': {'expected': 8.937209302325583, 'lower_bound': 8.858459379229767, 'upper_bound': 9.015959225421398, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:05'}, '2006': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.6, 'baseline_mean': 10.285714285714285, 'baseline_std': 0.36396959707621, 'hourly_consumption': 0.0102450592885376}, 'prediction': {'expected': 10.285714285714285, 'lower_bound': 9.921744688638075, 'upper_bound': 10.649683882790494, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:51:10'}, '1905': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 1.0, 'baseline_mean': 1.0511627906976748, 'baseline_std': 0.059249645461088435, 'hourly_consumption': 0.0}, 'prediction': {'expected': 1.0511627906976748, 'lower_bound': 0.9919131452365864, 'upper_bound': 1.1104124361587633, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:43:43'}, '1926': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 0.0, 'baseline_mean': 0.0, 'baseline_std': 0.0, 'hourly_consumption': 0.0}, 'prediction': {'expected': 0.0, 'lower_bound': 0, 'upper_bound': 0.0, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:44:25'}, '1901': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 1.0, 'baseline_mean': 1.0418604651162793, 'baseline_std': 0.06630577845799998, 'hourly_consumption': 0.0}, 'prediction': {'expected': 1.0418604651162793, 'lower_bound': 0.9755546866582793, 'upper_bound': 1.1081662435742792, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:44:21'}, '2002': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.0, 'baseline_mean': 23.539534883720936, 'baseline_std': 42.68261126665543, 'hourly_consumption': 0.014714285714285595}, 'prediction': {'expected': 23.539534883720936, 'lower_bound': 0, 'upper_bound': 66.22214615037636, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:51:48'}, '2119': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.3, 'baseline_mean': 8.362790697674418, 'baseline_std': 0.06554989308027105, 'hourly_consumption': 0.00842857142857141}, 'prediction': {'expected': 8.362790697674418, 'lower_bound': 8.297240804594146, 'upper_bound': 8.42834059075469, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:11'}, '1922': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.2, 'baseline_mean': 9.981395348837209, 'baseline_std': 0.4831719668002905, 'hourly_consumption': 0.01004775195439086}, 'prediction': {'expected': 9.981395348837209, 'lower_bound': 9.498223382036919, 'upper_bound': 10.464567315637499, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:45:07'}, '2011': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 5.2, 'baseline_mean': 5.149999999999998, 'baseline_std': 0.07407971974871934, 'hourly_consumption': 0.005000066138441174}, 'prediction': {'expected': 5.149999999999998, 'lower_bound': 5.075920280251278, 'upper_bound': 5.224079719748717, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:33:15'}, '2001': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.4, 'baseline_mean': 8.465116279069766, 'baseline_std': 0.10208241518786142, 'hourly_consumption': 0.008333443564068174}, 'prediction': {'expected': 8.465116279069766, 'lower_bound': 8.363033863881904, 'upper_bound': 8.567198694257629, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:31:02'}, '2020': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.4, 'baseline_mean': 10.214285714285714, 'baseline_std': 0.40277781115249434, 'hourly_consumption': 0.0102380952380954}, 'prediction': {'expected': 10.214285714285714, 'lower_bound': 9.811507903133219, 'upper_bound': 10.617063525438208, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:55:14'}, '2123': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 18.7, 'baseline_mean': 18.495348837209313, 'baseline_std': 0.44718883215679545, 'hourly_consumption': 0.018428815195968222}, 'prediction': {'expected': 18.495348837209313, 'lower_bound': 18.04816000505252, 'upper_bound': 18.942537669366107, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:19'}, '2012': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 5.1, 'baseline_mean': 5.0953488372093005, 'baseline_std': 0.17314113204481074, 'hourly_consumption': 0.004952380952380915}, 'prediction': {'expected': 5.0953488372093005, 'lower_bound': 4.92220770516449, 'upper_bound': 5.268489969254111, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:31:11'}, '2008': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 4.9, 'baseline_mean': 5.030232558139534, 'baseline_std': 0.09888637953523118, 'hourly_consumption': 0.0050476190476194645}, 'prediction': {'expected': 5.030232558139534, 'lower_bound': 4.931346178604303, 'upper_bound': 5.1291189376747655, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:52:31'}, '2112': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.2, 'baseline_mean': 8.220930232558137, 'baseline_std': 0.08035083646965518, 'hourly_consumption': 0.013523809523809558}, 'prediction': {'expected': 8.220930232558137, 'lower_bound': 8.140579396088482, 'upper_bound': 8.301281069027793, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:11'}, '2029': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 10.6, 'baseline_mean': 10.406976744186048, 'baseline_std': 0.6449050682583738, 'hourly_consumption': 0.010238095238094724}, 'prediction': {'expected': 10.406976744186048, 'lower_bound': 9.762071675927674, 'upper_bound': 11.051881812444423, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:46:50'}, '2032': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.4, 'baseline_mean': 8.500000000000002, 'baseline_std': 0.20976176963402998, 'hourly_consumption': 0.008571938805879597}, 'prediction': {'expected': 8.500000000000002, 'lower_bound': 8.290238230365972, 'upper_bound': 8.709761769634031, 'confidence': 0.68}, 'timestamp': '2025-02-25 22:31:29'}, '2021': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.3, 'baseline_mean': 8.392857142857148, 'baseline_std': 0.1967948754325569, 'hourly_consumption': 0.00843891004186944}, 'prediction': {'expected': 8.392857142857148, 'lower_bound': 8.19606226742459, 'upper_bound': 8.589652018289705, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:39:03'}, '2111': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 8.2, 'baseline_mean': 8.14418604651163, 'baseline_std': 0.17902158101003118, 'hourly_consumption': 0.008095238095238091}, 'prediction': {'expected': 8.14418604651163, 'lower_bound': 7.965164465501599, 'upper_bound': 8.323207627521661, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:11'}}}, 'a1Q4MNc2hZ0': {'abnormal': {'1112': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 591.6, 'baseline_mean': 466.54166666666674, 'baseline_std': 448.22924692775064, 'hourly_consumption': 0.41276107847425164}, 'prediction': {'expected': 466.54166666666674, 'lower_bound': 18.312419738916105, 'upper_bound': 914.7709135944174, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:59:24'}, '1125': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 1015.0, 'baseline_mean': 81.12916666666668, 'baseline_std': 215.95439329235583, 'hourly_consumption': 0.12199855793667062}, 'prediction': {'expected': 81.12916666666668, 'lower_bound': 0, 'upper_bound': 297.0835599590225, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:35:14'}, '1105': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 1024.4, 'baseline_mean': 871.25625, 'baseline_std': 244.24198229942618, 'hourly_consumption': 0.9724991430361409}, 'prediction': {'expected': 871.25625, 'lower_bound': 627.0142677005738, 'upper_bound': 1115.4982322994263, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:48:08'}}, 'normal': {'1122': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 337.3, 'baseline_mean': 1000.9375000000003, 'baseline_std': 598.0666417093765, 'hourly_consumption': 0.92672340425532}, 'prediction': {'expected': 1000.9375000000003, 'lower_bound': 402.8708582906238, 'upper_bound': 1599.0041417093769, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:44:45'}, '1222': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 9.3, 'baseline_mean': 528.6583333333333, 'baseline_std': 864.4682354730243, 'hourly_consumption': 0.5163404255319155}, 'prediction': {'expected': 528.6583333333333, 'lower_bound': 0, 'upper_bound': 1393.1265688063577, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:52:15'}, '1108': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 15.8, 'baseline_mean': 290.4270833333333, 'baseline_std': 473.00652990840706, 'hourly_consumption': 0.38114893617021733}, 'prediction': {'expected': 290.4270833333333, 'lower_bound': 0, 'upper_bound': 763.4336132417404, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:53:30'}, '1121': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 6.0, 'baseline_mean': 274.3374999999999, 'baseline_std': 405.9758056018147, 'hourly_consumption': 0.3166808510638301}, 'prediction': {'expected': 274.3374999999999, 'lower_bound': 0, 'upper_bound': 680.3133056018146, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:55:20'}, '1216': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 36.9, 'baseline_mean': 500.1333333333334, 'baseline_std': 832.4259219059632, 'hourly_consumption': 0.5089727071784027}, 'prediction': {'expected': 500.1333333333334, 'lower_bound': 0, 'upper_bound': 1332.5592552392966, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:56:26'}, '1219': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 1243.8, 'baseline_mean': 1371.4687499999998, 'baseline_std': 146.74887241764776, 'hourly_consumption': 1.4058131700570928}, 'prediction': {'expected': 1371.4687499999998, 'lower_bound': 1224.719877582352, 'upper_bound': 1518.2176224176476, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:33:16'}, '1116': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 728.6, 'baseline_mean': 896.0250000000001, 'baseline_std': 950.7370159009566, 'hourly_consumption': 0.8826704176073591}, 'prediction': {'expected': 896.0250000000001, 'lower_bound': 0, 'upper_bound': 1846.7620159009566, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:41:14'}, '1109': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 33.0, 'baseline_mean': 1379.254166666666, 'baseline_std': 1205.6533064282696, 'hourly_consumption': 1.3662391697497653}, 'prediction': {'expected': 1379.254166666666, 'lower_bound': 173.6008602383963, 'upper_bound': 2584.9074730949355, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:11'}, '1208': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 4.5, 'baseline_mean': 4.612499999999998, 'baseline_std': 0.08410985724102968, 'hourly_consumption': 0.08318952270631591}, 'prediction': {'expected': 4.612499999999998, 'lower_bound': 4.528390142758968, 'upper_bound': 4.696609857241028, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:57:19'}, '1102': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 15.7, 'baseline_mean': 640.0125000000002, 'baseline_std': 826.1795437819977, 'hourly_consumption': 0.5298660772331295}, 'prediction': {'expected': 640.0125000000002, 'lower_bound': 0, 'upper_bound': 1466.1920437819979, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:57:33'}, '1212': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 9.0, 'baseline_mean': 855.0249999999996, 'baseline_std': 1081.90299787389, 'hourly_consumption': 0.8774042553191477}, 'prediction': {'expected': 855.0249999999996, 'lower_bound': 0, 'upper_bound': 1936.9279978738896, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:47:20'}}}, 'a1hMUeoBSiK': {'abnormal': {'8902': {'current_status': {'abnormal': True, 'high_usage': False, 'current_power': 1508.0, 'baseline_mean': 1277.8291666666664, 'baseline_std': 917.3206585597906, 'hourly_consumption': 1.2786534119788748}, 'prediction': {'expected': 1277.8291666666664, 'lower_bound': 360.50850810687587, 'upper_bound': 2195.149825226457, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:18:25'}}, 'normal': {'8918': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 32.2, 'baseline_mean': 78.14791666666662, 'baseline_std': 316.3318033059612, 'hourly_consumption': 0.09574694437220738}, 'prediction': {'expected': 78.14791666666662, 'lower_bound': 0, 'upper_bound': 394.47971997262783, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:52:38'}, '8903': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 784.1, 'baseline_mean': 999.9354166666666, 'baseline_std': 448.69445391523493, 'hourly_consumption': 1.0747062578311493}, 'prediction': {'expected': 999.9354166666666, 'lower_bound': 551.2409627514317, 'upper_bound': 1448.6298705819015, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:30:03'}, '8912': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 148.4, 'baseline_mean': 1091.3500000000001, 'baseline_std': 649.0793827463502, 'hourly_consumption': 1.1760139008735315}, 'prediction': {'expected': 1091.3500000000001, 'lower_bound': 442.2706172536499, 'upper_bound': 1740.4293827463503, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:37:42'}, '8933': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 75.3, 'baseline_mean': 1027.64375, 'baseline_std': 1120.1172001570935, 'hourly_consumption': 1.0139268785683047}, 'prediction': {'expected': 1027.64375, 'lower_bound': 0, 'upper_bound': 2147.7609501570932, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:17:07'}, '8921': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 197.4, 'baseline_mean': 320.68541666666675, 'baseline_std': 551.3269671224313, 'hourly_consumption': 0.2962162673317657}, 'prediction': {'expected': 320.68541666666675, 'lower_bound': 0, 'upper_bound': 872.0123837890981, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:35:10'}, '8929': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 183.5, 'baseline_mean': 688.94375, 'baseline_std': 868.7703461952367, 'hourly_consumption': 0.7466896771829465}, 'prediction': {'expected': 688.94375, 'lower_bound': 0, 'upper_bound': 1557.7140961952368, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:00:10'}, '8915': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 14.8, 'baseline_mean': 252.54374999999985, 'baseline_std': 486.5002726404737, 'hourly_consumption': 0.30622000520106485}, 'prediction': {'expected': 252.54374999999985, 'lower_bound': 0, 'upper_bound': 739.0440226404736, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:37:47'}, '8906': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 11.0, 'baseline_mean': 659.6020833333336, 'baseline_std': 1181.090458547593, 'hourly_consumption': 0.6497098074445337}, 'prediction': {'expected': 659.6020833333336, 'lower_bound': 0, 'upper_bound': 1840.6925418809265, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:31:13'}, '8917': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 132.9, 'baseline_mean': 1233.547916666667, 'baseline_std': 658.3799947161029, 'hourly_consumption': 1.3379307084008099}, 'prediction': {'expected': 1233.547916666667, 'lower_bound': 575.1679219505642, 'upper_bound': 1891.9279113827702, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:41:50'}, '8923': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 11.2, 'baseline_mean': 642.5791666666668, 'baseline_std': 286.6399364599407, 'hourly_consumption': 0.6973273915767398}, 'prediction': {'expected': 642.5791666666668, 'lower_bound': 355.93923020672605, 'upper_bound': 929.2191031266075, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:50:27'}, '8907': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 14.7, 'baseline_mean': 565.8791666666665, 'baseline_std': 591.6717045285471, 'hourly_consumption': 0.6177094291894736}, 'prediction': {'expected': 565.8791666666665, 'lower_bound': 0, 'upper_bound': 1157.5508711952136, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:40:11'}, '8928': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 284.8, 'baseline_mean': 1096.3673913043478, 'baseline_std': 688.6930501736517, 'hourly_consumption': 1.198879406132523}, 'prediction': {'expected': 1096.3673913043478, 'lower_bound': 407.6743411306961, 'upper_bound': 1785.0604414779996, 'confidence': 0.68}, 'timestamp': '2025-02-26 12:22:20'}, '8909': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 72.4, 'baseline_mean': 1437.0041666666664, 'baseline_std': 600.4305582674972, 'hourly_consumption': 1.4991241031217786}, 'prediction': {'expected': 1437.0041666666664, 'lower_bound': 836.5736083991692, 'upper_bound': 2037.4347249341636, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:52:30'}, '8911': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 1105.9, 'baseline_mean': 1098.39375, 'baseline_std': 635.2821418451335, 'hourly_consumption': 1.0503102873556431}, 'prediction': {'expected': 1098.39375, 'lower_bound': 463.1116081548664, 'upper_bound': 1733.6758918451335, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:41:01'}, '8936': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 20.9, 'baseline_mean': 601.0749999999999, 'baseline_std': 791.030341968558, 'hourly_consumption': 0.7225191787137079}, 'prediction': {'expected': 601.0749999999999, 'lower_bound': 0, 'upper_bound': 1392.105341968558, 'confidence': 0.68}, 'timestamp': '2025-02-26 13:56:00'}, '8901': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 25.7, 'baseline_mean': 832.3187499999998, 'baseline_std': 774.8687695774615, 'hourly_consumption': 0.9193300157212182}, 'prediction': {'expected': 832.3187499999998, 'lower_bound': 57.44998042253826, 'upper_bound': 1607.1875195774614, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:47:44'}, '8927': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 338.4, 'baseline_mean': 763.4874999999998, 'baseline_std': 766.1812453274288, 'hourly_consumption': 0.8495419567607351}, 'prediction': {'expected': 763.4874999999998, 'lower_bound': 0, 'upper_bound': 1529.6687453274285, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:56:39'}, '8930': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 19.9, 'baseline_mean': 251.39583333333323, 'baseline_std': 603.7751226290079, 'hourly_consumption': 0.21123903638383637}, 'prediction': {'expected': 251.39583333333323, 'lower_bound': 0, 'upper_bound': 855.1709559623412, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:40:18'}, '8905': {'current_status': {'abnormal': False, 'high_usage': False, 'current_power': 71.1, 'baseline_mean': 727.9833333333332, 'baseline_std': 1052.6630938139774, 'hourly_consumption': 0.7144849760041593}, 'prediction': {'expected': 727.9833333333332, 'lower_bound': 0, 'upper_bound': 1780.6464271473105, 'confidence': 0.68}, 'timestamp': '2025-02-26 14:57:25'}}}}
+    # dept_room_num=find_dept_id(prediction_result)
     # print(dept_room_num)
-    dept_room_num={'218': [{'room_number': '1417', 'room_type_id': 'FXDJ05'}, {'room_number': '1418', 'room_type_id': 'FXDJ04'}], '214': [{'room_number': '1439', 'room_type_id': 'FXYY22'}, {'room_number': '1418', 'room_type_id': 'FXYY23'}], '231': [{'room_number': '1112', 'room_type_id': 'FXDS15'}, {'room_number': '1105', 'room_type_id': 'FXDS12'}], '229': [{'room_number': '1125', 'room_type_id': 'FXYY22'}]}
-    print(find_datas(dept_room_num))
+    dept_room_num={'214': [{'room_number': '1417', 'room_type_id': 'SRJ', 'abnormal_time': '2025-02-26 14:51:20', 'device_name': '94c960588b4b'}, {'room_number': '1439', 'room_type_id': 'DRJ', 'abnormal_time': '2025-02-26 14:36:50', 'device_name': '94c960588b85'}, {'room_number': '1418', 'room_type_id': 'ZNDC', 'abnormal_time': '2025-02-26 12:33:33', 'device_name': '94c960588b3a'}], '230': [{'room_number': '20布草间', 'room_type_id': 'RT20', 'abnormal_time': '2025-02-26 14:46:27', 'device_name': '94c96058a45f'}, {'room_number': '21层布草间', 'room_type_id': 'RT21', 'abnormal_time': '2025-02-26 14:32:01', 'device_name': '94c96058a479'}], '229': [{'room_number': '1112', 'room_type_id': 'ZNDC', 'abnormal_time': '2025-02-26 14:59:24', 'device_name': '94c96058a528'}, {'room_number': '1125', 'room_type_id': 'SSYYDCF', 'abnormal_time': '2025-02-26 14:35:14', 'device_name': '94c96058a4b7'}, {'room_number': '1105', 'room_type_id': 'RT11', 'abnormal_time': '2025-02-26 14:48:08', 'device_name': '94c96058a49a'}], '228': [{'room_number': '8902', 'room_type_id': 'ZNSRJ', 'abnormal_time': '2025-02-26 14:18:25', 'device_name': '94c960588b88'}]}
+    dept_info_map=find_datas(dept_room_num)
+    # print(dept_info_map)
+    # dept_info_map={'214': {'dept_name': '裕华珺悦主题酒店(华山风景区店)', 'dept_code': 'JDYH009', 'brand': '', 'dept_id': '214', 'rooms': [{'room_number': '1417', 'abnormal_time': '2025-02-26 14:51:20', 'status': 'OC', 'check_in_detail': '2024-12-30 00:00:00', 'check_out_detail': '2024-12-31 00:00:00'}, {'room_number': '1439', 'abnormal_time': '2025-02-26 14:36:50', 'status': 'OOO', 'check_in_detail': '2025-05-03 00:00:00', 'check_out_detail': '2025-05-04 00:00:00'}, {'room_number': '1418', 'abnormal_time': '2025-02-26 12:33:33', 'status': 'VD', 'check_in_detail': '2025-03-09 00:00:00', 'check_out_detail': '2025-03-10 00:00:00'}]}, '230': {'dept_name': '济南雅锦酒店管理有限公司', 'dept_code': 'JDYH018', 'brand': '', 'dept_id': '230', 'rooms': [{'room_number': '20布草间', 'abnormal_time': '2025-02-26 14:46:27', 'check_in_detail': None, 'check_out_detail': None}, {'room_number': '21层布草间', 'abnormal_time': '2025-02-26 14:32:01', 'check_in_detail': None, 'check_out_detail': None}]}, '229': {'dept_name': '裕华珺悦主题酒店（济南高铁西站店）', 'dept_code': 'JDYH016', 'brand': '', 'dept_id': '229', 'rooms': [{'room_number': '1112', 'abnormal_time': '2025-02-26 14:59:24', 'status': 'VD', 'check_in_detail': None, 'check_out_detail': None}, {'room_number': '1125', 'abnormal_time': '2025-02-26 14:35:14', 'status': 'OOO', 'check_in_detail': '2025-03-01 00:00:00', 'check_out_detail': '2025-03-02 00:00:00'}, {'room_number': '1105', 'abnormal_time': '2025-02-26 14:48:08', 'check_in_detail': None, 'check_out_detail': None}]}, '228': {'dept_name': '大富鲨S智能电竞酒店（济南和谐广场店）', 'dept_code': 'JDDS017', 'brand': '', 'dept_id': '228', 'rooms': [{'room_number': '8902', 'abnormal_time': '2025-02-26 14:18:25', 'status': 'VC', 'check_in_detail': '2025-02-11 00:00:00', 'check_out_detail': '2025-02-12 00:00:00'}]}}
+
+    # 保存数据到MySQL，获取记录数和JSON数据
+    saved_count, json_records = save_to_mysql(dept_info_map)
+
+    # 如果有记录，则发送到飞书
+    if saved_count > 0:
+        send_to_feishu(json_records)
 
     end_time = time.time()
     execution_time = end_time - start_time
