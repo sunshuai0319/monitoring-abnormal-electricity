@@ -333,9 +333,9 @@ def fetch_smart_meter_products():
                     product_room_mapping = {}
                     for product_key, room_num in cursor:
                         product_room_mapping.setdefault(product_key, []).append(room_num)
-                    
+
                     result["product_keys"] = list(product_room_mapping.keys())
-                
+
                 # 2. 为每个产品和房间准备结果容器
                 for pk, rooms in product_room_mapping.items():
                     result["meter_data"][pk] = {}
@@ -386,7 +386,7 @@ def fetch_smart_meter_products():
                                     if window_start <= script_time <= window_end:
                                         # 检查是否已存在该时间窗口的记录
                                         window_records = [r for r in result["meter_data"][pk][room_num]
-                                                         if window_start <= r['script_time'] <= window_end]
+                                                          if window_start <= r['script_time'] <= window_end]
 
                                         # 如果该窗口还没有记录，添加当前记录
                                         if not window_records:
@@ -727,6 +727,7 @@ def find_dept_id(data):
     # 发生错误时返回空字典
     return {}
 
+
 def find_datas(dept_room_num):
     """
     根据部门ID和房间信息查询部门及房间详情
@@ -958,17 +959,17 @@ def save_to_mysql(dept_info_map):
                 # 设置默认值
                 electricity_usage_status = '异常'
                 power_consumption = 0.000  # 可以根据实际情况修改
-                estimated_cost = 0.00      # 可以根据实际情况修改
+                estimated_cost = 0.00  # 可以根据实际情况修改
 
                 # 构建SQL插入语句
                 insert_sql = """
                     INSERT INTO abnormal_electricity_usage (
-                        id, dept_name, dept_id, dept_brand, room_num, 
+                        id,  dept_id, dept_brand, room_num, 
                         device_name, room_status, check_in_time, check_out_time,
                         electricity_usage_status, abnormal_time, 
                         power_consumption, estimated_electricity_cost
                     ) VALUES (
-                        %s, %s, %s, %s, %s, 
+                        %s, %s, %s, %s, 
                         %s, %s, %s, %s, 
                         %s, %s, 
                         %s, %s
@@ -977,7 +978,7 @@ def save_to_mysql(dept_info_map):
 
                 # 准备参数
                 params = (
-                    str(record_id), dept_name, dept_code, dept_brand, room_num,
+                    str(record_id), dept_code, dept_brand, room_num,
                     device_name, room_status, check_in_time, check_out_time,
                     electricity_usage_status, abnormal_time,
                     power_consumption, estimated_cost
@@ -1007,7 +1008,8 @@ def save_to_mysql(dept_info_map):
                     json_records.append(json_record)
 
                 except Exception as e:
-                    print(f"保存房间记录失败: 部门={dept_name}, 房间={room_num}, 状态={original_status}({room_status}), 错误: {e}")
+                    print(
+                        f"保存房间记录失败: 部门={dept_name}, 房间={room_num}, 状态={original_status}({room_status}), 错误: {e}")
 
         # 提交事务
         conn.commit()
