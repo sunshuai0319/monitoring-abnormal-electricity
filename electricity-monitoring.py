@@ -808,6 +808,8 @@ def find_datas(dept_room_num):
                         room_info['abnormal_time'] = abnormal_time
                         room_info['device_name'] = device_name
 
+
+
                         if room_result:
                             # 获取房间字段列表
                             room_field_names = [i[0] for i in cursor.description]
@@ -816,6 +818,23 @@ def find_datas(dept_room_num):
                             for i, name in enumerate(room_field_names):
                                 room_info[name] = room_result[i]
 
+                        # 查询异常时间点的电表累计用电量
+                        power_query = """
+                                           SELECT value
+                                           FROM smart_meter
+                                           WHERE room_num = %s AND device_name = %s AND gmt_modified = %s
+                                           ORDER BY script_time DESC
+                                           LIMIT 1
+                                       """
+                        cursor.execute(power_query, [room_number, device_name, abnormal_time])
+                        power_result = cursor.fetchone()
+                        if power_result and power_result[0]:
+                            try:
+                                room_info['power_consumption'] = float(power_result[0])
+                            except (TypeError, ValueError):
+                                room_info['power_consumption'] = 0.0
+                        else:
+                            room_info['power_consumption'] = 0.0
                         # 查询最新入住记录
                         checkin_query = """
                             SELECT check_in_detail, check_out_detail
@@ -958,7 +977,7 @@ def save_to_mysql(dept_info_map):
 
                 # 设置默认值
                 electricity_usage_status = '异常'
-                power_consumption = 0.000  # 可以根据实际情况修改
+                power_consumption = room.get('power_consumption')  # 可以根据实际情况修改
                 estimated_cost = 0.00  # 可以根据实际情况修改
 
                 # 构建SQL插入语句
@@ -1103,6 +1122,7 @@ if __name__ == "__main__":
     print("开始数据查询组装...")
     dept_room_num = find_dept_id(prediction_result)
     dept_info_map = find_datas(dept_room_num)
+    print(dept_info_map)
 
     # 保存数据到MySQL，获取记录数和JSON数据
     print("开始异常数据入库...")
