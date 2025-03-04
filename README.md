@@ -2,7 +2,7 @@
 3,33 * * * *
  /root/anaconda3/bin/python /usr/local/electricity-monitoring/electricity-monitoring.py >> /usr/local/electricity-monitoring/electricity-monitoring.log 2>&1
 
-# 智能电力监控系统
+# 智能电力监控系统-异常用电监测
 
 ## 项目概述
 
