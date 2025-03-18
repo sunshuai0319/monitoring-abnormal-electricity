@@ -36,11 +36,13 @@ class DatabaseConfig:
 class PowerUsageAnalyzer:
     WINDOW_SIZE = 48  # 测试专用窗口大小（实际生产环境保持48）
     DETECTION_WINDOW = 4  # 检测窗口（2小时）
-    THRESHOLD_MULTIPLIER = 1.96  # 建议调整为1.96（95%置信区间）
-    HIGH_USAGE_COUNT_THRESHOLD = 4  # 连续2小时高用电
+    THRESHOLD_MULTIPLIER = 4.0  # 从3.0调整到4.0（超出99.9%置信区间）
+    HIGH_USAGE_COUNT_THRESHOLD = 4  # 保持为4（要求全部点都超标）
     MIN_DATA_POINTS = 10  # 最小有效数据点数
-    RELATIVE_SAFETY_MARGIN = 0.1  # 相对安全边际10%
-    ABSOLUTE_SAFETY_MARGIN = 0.5  # 绝对安全边际0.5kW
+    RELATIVE_SAFETY_MARGIN = 0.8  # 从0.4调整为0.8（相对安全边际80%）
+    ABSOLUTE_SAFETY_MARGIN = 2.5  # 从1.2调整为2.5（绝对安全边际2.5kW）
+    MIN_ABNORMAL_POWER_DIFF = 3.0  # 从1.5调整为3.0（最小异常功率差值3.0kW）
+    MIN_PERCENT_INCREASE = 100  # 新增：最小百分比增长(100%，即翻倍)
     USE_RELATIVE_MARGIN = True  # 切换边际类型
 
     def __init__(self):
@@ -97,7 +99,7 @@ class PowerUsageAnalyzer:
         return (curr_ts - prev_ts) <= timedelta(minutes=35)  # 允许5分钟误差
 
     def detect_abnormal_usage(self):
-        """带安全边际的瞬时检测（修复版）"""
+        """带安全边际的瞬时检测（极其严格版）"""
         if len(self.baseline_window) < self.MIN_DATA_POINTS:
             return False
 
@@ -105,15 +107,24 @@ class PowerUsageAnalyzer:
         data = list(self.baseline_window)
         mean = sum(data) / len(data)
 
-        # 计算简单阈值
-        threshold = mean * (1 + self.RELATIVE_SAFETY_MARGIN)
+        # 忽略极低功率的基线（可能是待机状态）
+        if mean < 0.5:  # 如果平均功率小于0.5kW，不检测异常
+            return False
 
-        # 输出详细的调试信息
-        # print(f"【异常检测】 当前值: {self.current_usage}, 均值: {mean}, 阈值: {threshold}")
+        # 基于均值的相对和绝对阈值计算
+        relative_threshold = mean * (1 + self.RELATIVE_SAFETY_MARGIN)
+        absolute_threshold = mean + self.ABSOLUTE_SAFETY_MARGIN
 
-        # 明确返回比较结果
-        is_abnormal = self.current_usage > threshold
-        # print(f"是否异常: {is_abnormal}")
+        # 取两种阈值的最大值
+        threshold = max(relative_threshold, absolute_threshold)
+
+        # 检查是否同时满足多个条件:
+        # 1. 当前值超过阈值
+        # 2. 当前值与均值的差值超过最小异常功率差值
+        # 3. 当前值至少是均值的两倍(增加了百分比增长要求)
+        is_abnormal = (self.current_usage > threshold and
+                       (self.current_usage - mean) > self.MIN_ABNORMAL_POWER_DIFF and
+                       (mean > 0 and self.current_usage / mean * 100 >= 100 + self.MIN_PERCENT_INCREASE))
 
         return is_abnormal
 
@@ -125,15 +136,33 @@ class PowerUsageAnalyzer:
         return mean, std
 
     def detect_high_power_usage(self):
-        """持续检测逻辑优化"""
+        """持续检测逻辑（极其严格版）"""
         if len(self.detection_window) < self.DETECTION_WINDOW:
             return False
 
         mean, std = self._get_baseline_stats()
+
+        # 忽略极低功率的基线
+        if mean < 0.5:  # 如果平均功率小于0.5kW，不检测异常
+            return False
+
         threshold = mean + self.THRESHOLD_MULTIPLIER * std
 
-        # 检查检测窗口全部超标且时间连续
-        return all(usage > threshold for usage in self.detection_window) \
+        # 同时检查额外条件：功率平均值显著增长
+        avg_detection = sum(self.detection_window) / len(self.detection_window)
+
+        # 检测窗口的平均值必须比基线窗口高出指定比例
+        if avg_detection < mean * 2.0:  # 检测窗口平均值必须至少是基线窗口的2倍
+            return False
+
+        # 计算检测窗口中满足所有条件的异常点数
+        significant_anomalies = sum(1 for usage in self.detection_window
+                                    if (usage > threshold and
+                                        (usage - mean) > self.MIN_ABNORMAL_POWER_DIFF and
+                                        (usage / mean * 100 >= 100 + self.MIN_PERCENT_INCREASE)))
+
+        # 要求所有点都是显著异常且时间连续
+        return significant_anomalies >= self.HIGH_USAGE_COUNT_THRESHOLD \
             and self._check_time_continuity()
 
     def _check_time_continuity(self):
@@ -808,8 +837,6 @@ def find_datas(dept_room_num):
                         room_info['abnormal_time'] = abnormal_time
                         room_info['device_name'] = device_name
 
-
-
                         if room_result:
                             # 获取房间字段列表
                             room_field_names = [i[0] for i in cursor.description]
@@ -914,6 +941,7 @@ def find_datas(dept_room_num):
         traceback.print_exc()  # 打印详细错误信息
 
     return dept_info_map
+
 
 def save_to_mysql(dept_info_map):
     """
@@ -1060,13 +1088,20 @@ def send_to_feishu(json_records):
         return False
 
     # 构建发送数据
-    payload = {
-        "records": json_records,
-        "type": "electricalAnomaly"
-    }
+    # payload = {
+    #     "records": json_records,
+    #     "type": "electricalAnomaly"
+    # }
 
+    payload = {
+        "msg_type": "text",
+        "content": {
+            "text": "30分钟预测总数据量:" + str(len(json_records)) + '条'
+        }
+    }
     # 飞书机器人webhook地址
-    url = 'https://open.feishu.cn/anycross/trigger/callback/MDA0ZTdmZTVhNzkzY2U5YjE5NTY2NGJiODk0OWJiM2U3'
+    # url = 'https://open.feishu.cn/anycross/trigger/callback/MDA0ZTdmZTVhNzkzY2U5YjE5NTY2NGJiODk0OWJiM2U3'
+    url ='https://open.feishu.cn/open-apis/bot/v2/hook/1f35ca70-1c95-43f4-a253-6d4eed59818e'
 
     try:
         # 准备请求头
@@ -1129,8 +1164,8 @@ if __name__ == "__main__":
     saved_count, json_records = save_to_mysql(dept_info_map)
 
     # 如果有记录，则发送到飞书
-    if saved_count > 0:
-        send_to_feishu(json_records)
+    # if saved_count > 0:
+    #     send_to_feishu(json_records)
 
     end_time = time.time()
     execution_time = end_time - start_time
