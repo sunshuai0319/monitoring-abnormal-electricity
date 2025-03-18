@@ -1100,8 +1100,7 @@ def send_to_feishu(json_records):
         }
     }
     # 飞书机器人webhook地址
-    # url = 'https://open.feishu.cn/anycross/trigger/callback/MDA0ZTdmZTVhNzkzY2U5YjE5NTY2NGJiODk0OWJiM2U3'
-    url ='https://open.feishu.cn/open-apis/bot/v2/hook/1f35ca70-1c95-43f4-a253-6d4eed59818e'
+    url ='https://open.feishu.cn/open-apis/bot/v2/hook/xxxxx'
 
     try:
         # 准备请求头
